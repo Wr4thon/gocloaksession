@@ -8,6 +8,7 @@ import (
 	"github.com/Nerzal/gocloak/v7"
 	"github.com/go-resty/resty/v2"
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog"
 )
 
 // CallOption configures a Session
@@ -77,87 +78,127 @@ func NewSession(clientID, clientSecret, realm, uri string, calloptions ...CallOp
 }
 
 func (session *goCloakSession) ForceAuthenticate() error {
-	return session.authenticate()
+	return session.authenticate(nil)
 }
 
 func (session *goCloakSession) ForceRefresh() error {
-	return session.refreshToken()
+	return session.refreshToken(nil)
 }
 
 func (session *goCloakSession) GetKeycloakAuthToken() (*gocloak.JWT, error) {
-	if session.isAccessTokenValid() {
+	return session.getKeycloakAuthToken(zerolog.Nop())
+}
+
+func (session *goCloakSession) getKeycloakAuthToken(logger zerolog.Logger) (*gocloak.JWT, error) {
+	logger.Info().Msg("3.1. accesstoken")
+	if session.isAccessTokenValid(logger) {
+		logger.Info().Msg("3.1.4 accesstoken is valid")
 		return session.token, nil
 	}
 
-	if session.isRefreshTokenValid() {
-		err := session.refreshToken()
+	logger.Info().Msg("3.2. refreshtoken")
+	if session.isRefreshTokenValid(logger) {
+		logger.Info().Msg("3.2.3 refreshtoken is Valid, refreshing ...")
+		err := session.refreshToken(&logger)
 		if err == nil {
 			return session.token, nil
 		}
 	}
 
-	err := session.authenticate()
+	logger.Info().Msg("3.3. authenticate")
+	err := session.authenticate(&logger)
 	if err != nil {
+		logger.Error().Err(err)
 		return nil, err
 	}
 
 	return session.token, nil
 }
 
-func (session *goCloakSession) isAccessTokenValid() bool {
+func (session *goCloakSession) isAccessTokenValid(logger zerolog.Logger) bool {
 	if session.token == nil {
+		logger.Info().Msg("3.1.0 session is nil")
 		return false
 	}
 
 	if session.lastRequest.IsZero() {
+		logger.Info().Msg("3.1.1 lastRequest is zero")
 		return false
 	}
 
 	sessionExpiry := session.token.ExpiresIn - session.prematureAccessTokenRefreshThreshold
-	if int(time.Since(session.lastRequest).Seconds()) > sessionExpiry {
+	secondsSinceLastAuthentication := int(time.Since(session.lastRequest).Seconds())
+	isExpired := secondsSinceLastAuthentication > sessionExpiry
+
+	logger.Info().Msgf("3.1.2 sessionExpiry: %d\nsecondsSinceLastAuthentication: %d\nisExpired: %t\n", sessionExpiry, secondsSinceLastAuthentication, isExpired)
+	if isExpired {
 		return false
 	}
 
 	token, _, err := session.gocloak.DecodeAccessToken(context.Background(), session.token.AccessToken, session.realm, "")
+
+	logger.Info().Err(err).Msgf("3.1.3 token.Valid: %t\n", token.Valid)
 	return err == nil && token.Valid
 }
 
-func (session *goCloakSession) isRefreshTokenValid() bool {
+func (session *goCloakSession) isRefreshTokenValid(logger zerolog.Logger) bool {
 	if session.token == nil {
+		logger.Info().Msg("3.2.0 session is nil")
 		return false
 	}
 
 	if session.lastRequest.IsZero() {
+		logger.Info().Msg("3.2.1 lastRequest is zero")
 		return false
 	}
 
 	sessionExpiry := session.token.RefreshExpiresIn - session.prematureRefreshTokenRefreshThreshold
-	if int(time.Since(session.lastRequest).Seconds()) > sessionExpiry {
-		return false
-	}
+	secondsSinceLastAuthentication := int(time.Since(session.lastRequest).Seconds())
+	isExpired := secondsSinceLastAuthentication > sessionExpiry
 
-	return true
+	logger.Info().Msgf("3.2.2 sessionExpiry: %d\nsecondsSinceLastAuthentication: %d\nisExpired: %t\n", sessionExpiry, secondsSinceLastAuthentication, isExpired)
+
+	return !isExpired
 }
 
-func (session *goCloakSession) refreshToken() error {
+func (session *goCloakSession) refreshToken(logger *zerolog.Logger) error {
 	session.lastRequest = time.Now()
 
 	jwt, err := session.gocloak.RefreshToken(context.Background(), session.token.RefreshToken, session.clientID, session.clientSecret, session.realm)
 	if err != nil {
+		if logger != nil {
+			logger.Error().Err(err)
+		}
 		return errors.Wrap(err, "could not refresh keycloak-token")
 	}
 
+	if logger != nil {
+		logger.Info().Msgf("ExpiresIn: %d\nRefreshExpiresIn: %d\nLastRequest: %v",
+			jwt.ExpiresIn,
+			jwt.RefreshExpiresIn,
+			session.lastRequest)
+	}
 	session.token = jwt
 
 	return nil
 }
 
-func (session *goCloakSession) authenticate() error {
+func (session *goCloakSession) authenticate(logger *zerolog.Logger) error {
 	session.lastRequest = time.Now()
 
 	jwt, err := session.gocloak.LoginClient(context.Background(), session.clientID, session.clientSecret, session.realm)
 	if err != nil {
+		if logger != nil {
+			logger.Error().Err(err).Msg("3.2.0")
+		}
 		return errors.Wrap(err, "could not login to keycloak")
+	}
+
+	if logger != nil {
+		logger.Info().Msgf("3.2.1 ExpiresIn: %d\nRefreshExpiresIn: %d\nLastRequest: %v",
+			jwt.ExpiresIn,
+			jwt.RefreshExpiresIn,
+			session.lastRequest)
 	}
 
 	session.token = jwt
@@ -166,20 +207,33 @@ func (session *goCloakSession) authenticate() error {
 }
 
 func (session *goCloakSession) AddAuthTokenToRequest(client *resty.Client, request *resty.Request) error {
+	logger := zerolog.Ctx(request.Context()).With().
+		Str("path", request.RawRequest.RequestURI).
+		Str("RequestID", request.RawRequest.Header.Get("X-Request-ID")).Logger()
+
+	logger.Info().Msg("1. AddAuthTokenToRequest")
+
 	for _, shouldSkip := range session.skipConditions {
 		if shouldSkip(request) {
+			logger.Info().Msg("2. Skipping ... ")
 			return nil
 		}
 	}
 
-	token, err := session.GetKeycloakAuthToken()
+	logger.Info().Msg("3. GetKeycloakAuthToken")
+	token, err := session.getKeycloakAuthToken(logger)
 	if err != nil {
+		// 4.
+		logger.Error().Err(err)
 		return err
 	}
 
 	if token.TokenType != "bearer" {
+		logger.Info().Msg("5. bearer")
 		request.SetAuthScheme(token.TokenType)
 	}
+
+	logger.Info().Msg("6. set Token")
 	request.SetAuthToken(token.AccessToken)
 
 	return nil
