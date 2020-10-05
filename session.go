@@ -208,8 +208,8 @@ func (session *goCloakSession) authenticate(logger *zerolog.Logger) error {
 
 func (session *goCloakSession) AddAuthTokenToRequest(client *resty.Client, request *resty.Request) error {
 	logger := zerolog.Ctx(request.Context()).With().
-		Str("path", request.RawRequest.RequestURI).
-		Str("RequestID", request.RawRequest.Header.Get("X-Request-ID")).Logger()
+		Str("path", request.URL).
+		Str("RequestID", request.Header.Get("X-Request-ID")).Logger()
 
 	logger.Info().Msg("1. AddAuthTokenToRequest")
 
